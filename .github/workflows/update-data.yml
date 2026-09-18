@@ -28,10 +28,13 @@ jobs:
       - name: Fetch sectors, macro, flows, Nifty 500 index, breadth
         run: python3 scripts/fetch_live_data.py
 
+      - name: Fetch global ETF universe (977 tickers)
+        run: python3 scripts/fetch_global_etf_data.py
+
       - name: Commit updated data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/etf-history.json data/live.json data/nifty500-price.json data/breadth-history.json
+          git add data/etf-history.json data/live.json data/nifty500-price.json data/breadth-history.json data/global-etf-history.json
           git diff --quiet --cached || git commit -m "Update live data ($(date -u +%Y-%m-%d))"
           git push
