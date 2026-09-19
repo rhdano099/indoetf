@@ -9,32 +9,84 @@ on:
 permissions:
   contents: write
 
+# The three fetch scripts don't depend on each other, so they run as separate parallel
+# jobs instead of one after another — this is the single biggest speedup: total run time
+# drops from the SUM of all three scripts to roughly the LONGEST one (the global ETF
+# fetch, since it's by far the biggest ticker list). A final job waits for all three and
+# commits everything together in one push.
 jobs:
-  update-data:
+  fetch-etf:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
+        with: { python-version: "3.12" }
       - name: Install dependencies
         run: pip install yfinance pandas
-
-      - name: Fetch ETF price history
+      - name: Fetch Indian ETF price history
         run: python3 scripts/fetch_etf_data.py
+      - name: Upload data file
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-etf
+          path: data/etf-history.json
+          retention-days: 1
 
-      - name: Fetch sectors, macro, flows, Nifty 500 index, breadth
+  fetch-live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install dependencies
+        run: pip install yfinance pandas
+      - name: Fetch sectors, macro, flows, Nifty 500 + Smallcap 250 index & breadth
         run: python3 scripts/fetch_live_data.py
+      - name: Upload data files
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-live
+          path: |
+            data/live.json
+            data/nifty500-price.json
+            data/breadth-history.json
+            data/niftysc250-price.json
+            data/breadth-history-sc250.json
+          retention-days: 1
 
-      - name: Fetch global ETF universe (977 tickers)
+  fetch-global-etf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install dependencies
+        run: pip install yfinance pandas
+      - name: Fetch global ETF universe (966 tickers)
         run: python3 scripts/fetch_global_etf_data.py
+      - name: Upload data file
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-global-etf
+          path: data/global-etf-history.json
+          retention-days: 1
 
+  commit:
+    needs: [fetch-etf, fetch-live, fetch-global-etf]
+    if: always() && (needs.fetch-etf.result == 'success' || needs.fetch-live.result == 'success' || needs.fetch-global-etf.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all data files
+        uses: actions/download-artifact@v4
+        with:
+          pattern: data-*
+          path: data
+          merge-multiple: true
       - name: Commit updated data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/etf-history.json data/live.json data/nifty500-price.json data/breadth-history.json data/global-etf-history.json
+          git add data/etf-history.json data/live.json data/nifty500-price.json data/breadth-history.json data/niftysc250-price.json data/breadth-history-sc250.json data/global-etf-history.json
           git diff --quiet --cached || git commit -m "Update live data ($(date -u +%Y-%m-%d))"
           git push
