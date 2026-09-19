@@ -9,6 +9,14 @@ Run locally with:  python3 scripts/fetch_etf_data.py
 Runs automatically via .github/workflows/update-data.yml on a daily schedule.
 
 No API key needed — yfinance reads Yahoo Finance's public endpoints.
+
+Fetched with yf.download() in small batches, not one yf.Ticker(...).history() call per
+symbol — every single-ticker Ticker.history() fetch in this project has ended up hitting
+Yahoo's rate limit hard on GitHub's runner IPs (this same site's Nifty 500 index price,
+Nifty Smallcap 250 index price, and the original version of this exact script all hit it),
+while yf.download()'s batched endpoint has consistently held up. Small batches + no
+threading + pauses between them is what keeps this reliable — see fetch_global_etf_data.py
+for the same pattern.
 """
 import json
 import time
@@ -35,44 +43,55 @@ SYMBOLS = [
 
 OUT_PATH = "data/etf-history.json"
 LOOKBACK = "2y"     # how much history to keep in the JSON (trim to taste)
+BATCH_SIZE = 20
 RETRIES = 4
-SLEEP_BETWEEN = 1.0   # seconds between tickers, be polite to Yahoo's endpoint
-SLEEP_ON_RETRY = 8.0  # backs off further each retry — a flat 1.5s wasn't enough once Yahoo
-                       # started rate-limiting (this job now runs alongside two other fetch
-                       # jobs in parallel, all hitting Yahoo from GitHub's runner IP range)
+SLEEP_BETWEEN_BATCHES = 2.5
+SLEEP_ON_RETRY = 8.0
 
 
-def fetch_one(ticker):
+def fetch_batch(tickers):
+    out = {}
+    raw = None
     for attempt in range(RETRIES):
         try:
-            h = yf.Ticker(ticker + ".NS").history(period=LOOKBACK, interval="1d", auto_adjust=True)
-            if len(h) > 0:
-                series = [[d.strftime("%Y-%m-%d"), round(float(c), 4)] for d, c in h["Close"].items() if c == c]
-                if series:
-                    return series
+            raw = yf.download([t + ".NS" for t in tickers], period=LOOKBACK, interval="1d",
+                               auto_adjust=True, group_by="ticker", threads=False, progress=False)
+            if raw is not None and len(raw) > 0:
+                break
         except Exception as e:
-            print(f"  {ticker}: attempt {attempt+1} failed ({e})")
+            print(f"  batch download attempt {attempt+1} failed: {e}")
+            raw = None
         time.sleep(SLEEP_ON_RETRY * (attempt + 1))
-    return None
+    if raw is None or len(raw) == 0:
+        return out
+    single = len(tickers) == 1
+    for t in tickers:
+        try:
+            s = raw["Close"] if single else raw[t + ".NS"]["Close"]
+            s = s.dropna()
+            if len(s) > 0:
+                out[t] = [[d.strftime("%Y-%m-%d"), round(float(c), 4)] for d, c in s.items()]
+        except Exception:
+            continue
+    return out
 
 
 def main():
     result = {}
     missing = []
-    for i, sym in enumerate(SYMBOLS, 1):
-        print(f"[{i}/{len(SYMBOLS)}] {sym} ...", end=" ")
-        series = fetch_one(sym)
-        if series:
-            result[sym] = series
-            print(f"{len(series)} rows")
-        else:
-            missing.append(sym)
-            print("FAILED")
-        # Save progress after every symbol so a run that gets cut off partway (timeout,
+    n_batches = (len(SYMBOLS) - 1) // BATCH_SIZE + 1
+    for i in range(0, len(SYMBOLS), BATCH_SIZE):
+        batch = SYMBOLS[i:i + BATCH_SIZE]
+        batch_num = i // BATCH_SIZE + 1
+        got = fetch_batch(batch)
+        result.update(got)
+        missing.extend([s for s in batch if s not in got])
+        print(f"Batch {batch_num}/{n_batches}: got {len(got)}/{len(batch)} — running total {len(result)}")
+        # Save progress after every batch so a run that gets cut off partway (timeout,
         # rate-limit) still keeps whatever it fetched instead of losing the whole thing.
         with open(OUT_PATH, "w") as f:
             json.dump(result, f, separators=(",", ":"))
-        time.sleep(SLEEP_BETWEEN)
+        time.sleep(SLEEP_BETWEEN_BATCHES)
 
     print(f"\nWrote {OUT_PATH}: {len(result)}/{len(SYMBOLS)} symbols.")
     if missing:
