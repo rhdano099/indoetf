@@ -250,15 +250,21 @@ def fetch_index_price(ticker, existing, label):
         print(f"  {label} price: no data fetched, keeping existing ({len(existing)} rows)")
         return existing
 
-    new_last = series[-1][0]
+    new_first, new_last = series[0][0], series[-1][0]
+    old_first = existing[0][0] if existing else None
     old_last = existing[-1][0] if existing else None
     days_stale = (datetime.date.today() - datetime.datetime.strptime(new_last, "%Y-%m-%d").date()).days
     if days_stale > 10:
         print(f"  {label} price: fetched series is still stale (latest {new_last}, {days_stale}d old) — Yahoo may not have fresher data for this ticker right now")
-    if old_last and old_last >= new_last:
-        print(f"  {label} price: existing data ({old_last}) already as fresh or fresher than fetch ({new_last}), keeping existing")
+    # BUG FIX: this used to only compare the *latest* date ("is the new fetch at least as
+    # fresh as what we already have"), which is true on almost every run (both series are
+    # "as of today"), so it kept discarding a deeper 25-year re-fetch in favor of whatever
+    # shallow series was already saved. Now: only keep the existing series if it is BOTH at
+    # least as deep (more/equal rows, i.e. goes back at least as far) AND at least as fresh.
+    if existing and len(existing) >= len(series) and old_first <= new_first and old_last >= new_last:
+        print(f"  {label} price: existing ({len(existing)} rows, {old_first}..{old_last}) already as deep and fresh as fetch ({len(series)} rows, {new_first}..{new_last}), keeping existing")
         return existing
-    print(f"  {label} price: {len(series)} rows, latest {new_last}")
+    print(f"  {label} price: {len(series)} rows, {new_first}..{new_last} (was {len(existing)} rows, {old_first}..{old_last})")
     return series
 
 
