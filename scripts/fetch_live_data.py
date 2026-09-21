@@ -212,25 +212,40 @@ def fetch_index_price(ticker, existing, label):
     # instead, so that's used here, with the existing series only replaced when the new
     # pull is actually fresher (never regress to something staler than what's already saved).
     series = None
+
+    def try_download(kwargs):
+        h = yf.download(ticker, interval="1d", auto_adjust=True, threads=False, progress=False, **kwargs)
+        if h is None or len(h) == 0:
+            return None
+        closes = h["Close"]
+        if hasattr(closes, "iloc") and closes.ndim > 1:
+            closes = closes.iloc[:, 0]
+        s = [[d.strftime("%Y-%m-%d"), round(float(c), 2)] for d, c in closes.dropna().items()]
+        return s or None
+
     # Try the deepest pull first (an explicit 25-year start date, same depth as the breadth
-    # seed below), then fall back to shorter, well-tested period tokens if that comes back
-    # empty. Whatever Yahoo actually has for a given index — some go back decades, some don't
-    # exist as a ticker until a few years ago — this naturally returns "up to 25 years."
-    attempts = [("start", seed_start_date())] + [("period", p) for p in ("10y", "5y", "2y", "1y")]
-    for kind, val in attempts:
+    # seed below) — retried a few times, since this is the one attempt worth not giving up on
+    # early — then fall back to shorter, well-tested period tokens only if that keeps failing.
+    # Whatever Yahoo actually has for a given index — some go back decades, some don't exist
+    # as a ticker until a few years ago — this naturally returns "up to 25 years."
+    start_date = seed_start_date()
+    for attempt in range(3):
         try:
-            kwargs = {"start": val} if kind == "start" else {"period": val}
-            h = yf.download(ticker, interval="1d", auto_adjust=True,
-                             threads=False, progress=False, **kwargs)
-            if h is not None and len(h) > 0:
-                closes = h["Close"]
-                if hasattr(closes, "iloc") and closes.ndim > 1:
-                    closes = closes.iloc[:, 0]
-                series = [[d.strftime("%Y-%m-%d"), round(float(c), 2)] for d, c in closes.dropna().items()]
+            series = try_download({"start": start_date})
+            if series:
+                break
+        except Exception as e:
+            print(f"  {label} price (start={start_date}, attempt {attempt+1}/3) FAILED: {e}")
+        time.sleep(4.0 * (attempt + 1))
+
+    if not series:
+        for period in ("10y", "5y", "2y", "1y"):
+            try:
+                series = try_download({"period": period})
                 if series:
                     break
-        except Exception as e:
-            print(f"  {label} price ({kind}={val}) FAILED: {e}")
+            except Exception as e:
+                print(f"  {label} price (period={period}) FAILED: {e}")
     if not series:
         print(f"  {label} price: no data fetched, keeping existing ({len(existing)} rows)")
         return existing
