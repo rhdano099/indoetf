@@ -67,12 +67,28 @@ INDEX_CONFIGS = [
     },
 ]
 
-SEED_PERIOD = "3y"       # used the first few runs, until an index's data is no longer "thin"
+SEED_YEARS = 25           # how far back to seed on first run / while an index is still "thin".
+                          # "25y" isn't a valid yfinance `period` token (only 1d/5d/1mo/3mo/
+                          # 6mo/1y/2y/5y/10y/ytd/max are), so this is turned into an explicit
+                          # start= date instead of a period string — see seed_start_date().
+                          # Not every constituent will actually have 25 years of listed
+                          # history (plenty of midcap/smallcap names are far younger), so in
+                          # practice this pulls "as much as exists, up to 25 years."
 INCREMENTAL_PERIOD = "500d"  # ~340 trading days — comfortably more than the 252 needed for
                               # a 52-week high/low window, once an index is already seeded
-SEED_THRESHOLD = 200
+SEED_THRESHOLD = 5000     # ~25y of trading days (~6,300) minus the 252-day SMA/52W warm-up,
+                          # with some margin for holidays/gaps — comfortably above what a 10y
+                          # seed would produce, so a site still on the old 10y seed reseeds
+                          # once more to the full 25y depth, then just appends daily after that.
 HIGH_LOW_WINDOW = 252     # ~52 weeks of trading sessions
 SMA_WINDOW = 200
+BREADTH_BATCH_SIZE = 40  # yf.download() in small batches, not one big multi-hundred-ticker
+                          # call — same lesson as fetch_etf_data.py: one huge batched call
+                          # (500 tickers x 10 years for Nifty 500) is far more likely to get
+                          # rate-limited or come back empty than several smaller ones.
+BREADTH_RETRIES = 3
+BREADTH_SLEEP_BETWEEN_BATCHES = 2.0
+BREADTH_SLEEP_ON_RETRY = 6.0
 
 SECTOR_TICKERS = [
     ("FMCG", "^CNXFMCG"),
@@ -196,10 +212,16 @@ def fetch_index_price(ticker, existing, label):
     # instead, so that's used here, with the existing series only replaced when the new
     # pull is actually fresher (never regress to something staler than what's already saved).
     series = None
-    for period in ("10y", "5y", "2y", "1y"):
+    # Try the deepest pull first (an explicit 25-year start date, same depth as the breadth
+    # seed below), then fall back to shorter, well-tested period tokens if that comes back
+    # empty. Whatever Yahoo actually has for a given index — some go back decades, some don't
+    # exist as a ticker until a few years ago — this naturally returns "up to 25 years."
+    attempts = [("start", seed_start_date())] + [("period", p) for p in ("10y", "5y", "2y", "1y")]
+    for kind, val in attempts:
         try:
-            h = yf.download(ticker, period=period, interval="1d", auto_adjust=True,
-                             threads=False, progress=False)
+            kwargs = {"start": val} if kind == "start" else {"period": val}
+            h = yf.download(ticker, interval="1d", auto_adjust=True,
+                             threads=False, progress=False, **kwargs)
             if h is not None and len(h) > 0:
                 closes = h["Close"]
                 if hasattr(closes, "iloc") and closes.ndim > 1:
@@ -208,7 +230,7 @@ def fetch_index_price(ticker, existing, label):
                 if series:
                     break
         except Exception as e:
-            print(f"  {label} price ({period}) FAILED: {e}")
+            print(f"  {label} price ({kind}={val}) FAILED: {e}")
     if not series:
         print(f"  {label} price: no data fetched, keeping existing ({len(existing)} rows)")
         return existing
@@ -239,26 +261,54 @@ def load_constituents(constituents_url, label):
         return None
 
 
-def compute_breadth_frame(tickers, period, label):
-    # Single yf.download() batch serves both metrics: % above 200-day SMA, and new 52-week
-    # highs/lows/net — computed together so there's only one (expensive) download per index
-    # per run, not two.
-    import pandas as pd
-    try:
-        raw = yf.download(tickers, period=period, interval="1d", auto_adjust=True,
-                           group_by="ticker", threads=True, progress=False)
-    except Exception as e:
-        print(f"  {label} breadth price download FAILED: {e}")
-        return None
+def seed_start_date():
+    return (datetime.date.today() - datetime.timedelta(days=SEED_YEARS * 365)).strftime("%Y-%m-%d")
 
+
+def compute_breadth_frame(tickers, label, period=None, start=None):
+    # One metric-computing pass serves both % above 200-day SMA and new 52-week highs/lows/net
+    # — but the price DOWNLOAD itself is done in small batches (not one big multi-hundred-
+    # ticker yf.download() call), same reasoning as fetch_etf_data.py: a single huge batch
+    # (500 tickers x 25 years for Nifty 500) is far more likely to get rate-limited or come
+    # back empty on GitHub's runner IPs than several smaller ones with pauses between them.
+    # Pass exactly one of period (e.g. "500d", a valid yfinance token) or start (an explicit
+    # "YYYY-MM-DD", used for the multi-year seed pull since "25y" isn't a real yfinance period).
+    import pandas as pd
     closes = {}
-    for t in tickers:
-        try:
-            s = raw[t]["Close"].dropna()
-            if len(s) >= SMA_WINDOW:
-                closes[t] = s
-        except Exception:
+    n_batches = (len(tickers) - 1) // BREADTH_BATCH_SIZE + 1
+    for bi in range(0, len(tickers), BREADTH_BATCH_SIZE):
+        batch = tickers[bi:bi + BREADTH_BATCH_SIZE]
+        batch_num = bi // BREADTH_BATCH_SIZE + 1
+        raw = None
+        for attempt in range(BREADTH_RETRIES):
+            try:
+                kwargs = dict(interval="1d", auto_adjust=True, group_by="ticker", threads=False, progress=False)
+                if start:
+                    kwargs["start"] = start
+                else:
+                    kwargs["period"] = period
+                raw = yf.download(batch, **kwargs)
+                if raw is not None and len(raw) > 0:
+                    break
+            except Exception as e:
+                print(f"  {label} breadth batch {batch_num}/{n_batches} attempt {attempt+1} failed: {e}")
+                raw = None
+            time.sleep(BREADTH_SLEEP_ON_RETRY * (attempt + 1))
+        if raw is None or len(raw) == 0:
+            print(f"  {label} breadth batch {batch_num}/{n_batches}: no data")
             continue
+        single = len(batch) == 1
+        for t in batch:
+            try:
+                s = raw["Close"] if single else raw[t]["Close"]
+                s = s.dropna()
+                if len(s) >= SMA_WINDOW:
+                    closes[t] = s
+            except Exception:
+                continue
+        print(f"  {label} breadth batch {batch_num}/{n_batches}: {len(closes)} usable ticker(s) so far")
+        time.sleep(BREADTH_SLEEP_BETWEEN_BATCHES)
+
     if not closes:
         print(f"  {label} breadth: no usable price series")
         return None
@@ -352,13 +402,15 @@ def main():
         existing_extra = extra_all.get(key)
         reseeding = (len(existing_pct) < SEED_THRESHOLD and not cfg["pct_has_backfill"]) or \
                     (not existing_extra) or (len(existing_extra.get("dates", [])) < SEED_THRESHOLD)
-        period = SEED_PERIOD if reseeding else INCREMENTAL_PERIOD
 
         symbols = load_constituents(cfg["constituents_url"], key)
         if not symbols:
             continue
         tickers = [s + ".NS" for s in symbols]
-        rows = compute_breadth_frame(tickers, period, key)
+        if reseeding:
+            rows = compute_breadth_frame(tickers, key, start=seed_start_date())
+        else:
+            rows = compute_breadth_frame(tickers, key, period=INCREMENTAL_PERIOD)
         if rows is None:
             continue
 
