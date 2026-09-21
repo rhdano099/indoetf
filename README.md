@@ -1,4 +1,4 @@
-# Bhavcopy — Right Horizons markets desk
+# Right Horizons markets desk
 
 Static site (`index.html`) + a scheduled GitHub Action that keeps `data/etf-history.json`
 fresh with real NSE ETF prices via `yfinance` (no API key needed).
