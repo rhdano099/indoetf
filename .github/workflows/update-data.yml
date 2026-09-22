@@ -22,10 +22,10 @@ concurrency:
   group: update-etf-data
   cancel-in-progress: false
 
-# The three fetch scripts don't depend on each other, so they run as separate parallel
+# The four fetch scripts don't depend on each other, so they run as separate parallel
 # jobs instead of one after another — this is the single biggest speedup: total run time
-# drops from the SUM of all three scripts to roughly the LONGEST one (the global ETF
-# fetch, since it's by far the biggest ticker list). A final job waits for all three and
+# drops from the SUM of all four scripts to roughly the LONGEST one (the global ETF
+# fetch, since it's by far the biggest ticker list). A final job waits for all four and
 # commits everything together in one push.
 jobs:
   fetch-etf:
@@ -89,9 +89,26 @@ jobs:
           path: data/global-etf-history.json
           retention-days: 1
 
+  fetch-breakout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install dependencies
+        run: pip install yfinance pandas
+      - name: Scan the global ETF universe for today's breakouts (new 20-day high + volume confirmation)
+        run: python3 scripts/fetch_breakout_scanner.py
+      - name: Upload data file
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-breakout
+          path: data/breakout-scanner.json
+          retention-days: 1
+
   commit:
-    needs: [fetch-etf, fetch-live, fetch-global-etf]
-    if: always() && (needs.fetch-etf.result == 'success' || needs.fetch-live.result == 'success' || needs.fetch-global-etf.result == 'success')
+    needs: [fetch-etf, fetch-live, fetch-global-etf, fetch-breakout]
+    if: always() && (needs.fetch-etf.result == 'success' || needs.fetch-live.result == 'success' || needs.fetch-global-etf.result == 'success' || needs.fetch-breakout.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,7 +122,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/etf-history.json data/live.json data/nifty50-price.json data/breadth-history-nifty50.json data/nifty500-price.json data/breadth-history.json data/niftymidcap150-price.json data/breadth-history-midcap150.json data/niftysc250-price.json data/breadth-history-sc250.json data/breadth-extra.json data/global-etf-history.json
+          git add data/etf-history.json data/live.json data/nifty50-price.json data/breadth-history-nifty50.json data/nifty500-price.json data/breadth-history.json data/niftymidcap150-price.json data/breadth-history-midcap150.json data/niftysc250-price.json data/breadth-history-sc250.json data/breadth-extra.json data/global-etf-history.json data/breakout-scanner.json
           git diff --quiet --cached || git commit -m "Update live data ($(date -u +%Y-%m-%d))"
           # Belt-and-braces: if something else (a manual edit on GitHub, an overlapping run
           # the concurrency guard above didn't catch) pushed to main in the meantime, rebase
