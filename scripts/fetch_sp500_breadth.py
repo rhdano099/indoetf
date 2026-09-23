@@ -27,11 +27,14 @@ Usage:
     python3 scripts/fetch_sp500_breadth.py [--sleep 0.5] [--resume]
 
 Writes / updates (relative to this script's parent folder, i.e. the repo root):
-    data/sp500-price.json          -- [["YYYY-MM-DD", indexLevel], ...]
+    data/sp500-price.json           -- [["YYYY-MM-DD", indexLevel], ...]
     data/breadth-history-sp500.json -- [["YYYY-MM-DD", pctAbove200Sma], ...]
-    data/breadth-extra.json         -- merges in a "sp500" key alongside
-                                        the existing Nifty indices' entries
-                                        (does NOT overwrite the others)
+    data/breadth-extra-sp500.json   -- {"sp500": {dates, newHighs, newLows, netHL}} --
+                                        a SEPARATE file, not a merge into
+                                        breadth-extra.json (see the comment above
+                                        the code that writes it for why). The
+                                        GitHub Actions workflow merges this into
+                                        the final data/breadth-extra.json.
 """
 import argparse
 import json
@@ -179,12 +182,15 @@ def main():
     (DATA_DIR / "breadth-history-sp500.json").write_text(json.dumps(pct_series))
     print(f"Wrote {DATA_DIR / 'breadth-history-sp500.json'} ({len(pct_series)} days)")
 
-    # Merge the "sp500" key into breadth-extra.json without clobbering the existing indices.
-    extra_path = DATA_DIR / "breadth-extra.json"
-    all_extra = json.loads(extra_path.read_text()) if extra_path.exists() else {}
-    all_extra["sp500"] = extra
-    extra_path.write_text(json.dumps(all_extra))
-    print(f"Updated {extra_path} with the 'sp500' key ({len(all_extra)} indices total)")
+    # Write to a SEPARATE file rather than merging into breadth-extra.json directly.
+    # This script runs as its own parallel GitHub Actions job alongside
+    # fetch_live_data.py (which also writes breadth-extra.json for the 4 Nifty
+    # indices), each in its own isolated checkout -- if both scripts tried to
+    # read-modify-write the *same* file, whichever job's artifact got downloaded
+    # last would silently clobber the other's data. The workflow's commit job
+    # merges this file with the Nifty one after both jobs finish.
+    (DATA_DIR / "breadth-extra-sp500.json").write_text(json.dumps({"sp500": extra}))
+    print(f"Wrote {DATA_DIR / 'breadth-extra-sp500.json'} (merged into breadth-extra.json by the workflow)")
 
     print("\nFetching S&P 500 (^GSPC) index level for the price chart...")
     spx = pull_history("^GSPC", HISTORY_YEARS)
