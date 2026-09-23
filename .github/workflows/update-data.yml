@@ -89,6 +89,26 @@ jobs:
           path: data/global-etf-history.json
           retention-days: 1
 
+  fetch-sp500:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install dependencies
+        run: pip install yfinance pandas lxml
+      - name: Fetch S&P 500 constituents & breadth (SMA/highs/lows)
+        run: python3 scripts/fetch_sp500_breadth.py
+      - name: Upload data files
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-sp500
+          path: |
+            data/sp500-price.json
+            data/breadth-history-sp500.json
+            data/breadth-extra-sp500.json
+          retention-days: 1
+
   fetch-breakout:
     runs-on: ubuntu-latest
     steps:
@@ -107,22 +127,32 @@ jobs:
           retention-days: 1
 
   commit:
-    needs: [fetch-etf, fetch-live, fetch-global-etf, fetch-breakout]
-    if: always() && (needs.fetch-etf.result == 'success' || needs.fetch-live.result == 'success' || needs.fetch-global-etf.result == 'success' || needs.fetch-breakout.result == 'success')
+    needs: [fetch-etf, fetch-live, fetch-global-etf, fetch-breakout, fetch-sp500]
+    if: always() && (needs.fetch-etf.result == 'success' || needs.fetch-live.result == 'success' || needs.fetch-global-etf.result == 'success' || needs.fetch-breakout.result == 'success' || needs.fetch-sp500.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
       - name: Download all data files
         uses: actions/download-artifact@v4
         with:
           pattern: data-*
           path: data
           merge-multiple: true
+      - name: Merge S&P 500 breadth into breadth-extra.json
+        # fetch-live and fetch-sp500 run in parallel, isolated checkouts, and each
+        # produces its own breadth data -- fetch-live writes the 4 Nifty indices'
+        # breadth-extra.json, fetch-sp500 writes its "sp500" entry to a SEPARATE
+        # file (breadth-extra-sp500.json) precisely so the two artifacts can't
+        # clobber each other. This step combines them into the one file the site
+        # actually reads.
+        run: python3 scripts/merge_breadth_extra.py
       - name: Commit updated data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/etf-history.json data/live.json data/nifty50-price.json data/breadth-history-nifty50.json data/nifty500-price.json data/breadth-history.json data/niftymidcap150-price.json data/breadth-history-midcap150.json data/niftysc250-price.json data/breadth-history-sc250.json data/breadth-extra.json data/global-etf-history.json data/breakout-scanner.json
+          git add data/etf-history.json data/live.json data/nifty50-price.json data/breadth-history-nifty50.json data/nifty500-price.json data/breadth-history.json data/niftymidcap150-price.json data/breadth-history-midcap150.json data/niftysc250-price.json data/breadth-history-sc250.json data/breadth-extra.json data/global-etf-history.json data/breakout-scanner.json data/sp500-price.json data/breadth-history-sp500.json
           git diff --quiet --cached || git commit -m "Update live data ($(date -u +%Y-%m-%d))"
           # Belt-and-braces: if something else (a manual edit on GitHub, an overlapping run
           # the concurrency guard above didn't catch) pushed to main in the meantime, rebase
