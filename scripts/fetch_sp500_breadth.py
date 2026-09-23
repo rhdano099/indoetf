@@ -37,6 +37,7 @@ Writes / updates (relative to this script's parent folder, i.e. the repo root):
                                         the final data/breadth-extra.json.
 """
 import argparse
+import io
 import json
 import sys
 import time
@@ -44,12 +45,23 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 
 WIKI_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+# Wikipedia rejects/rate-limits anonymous requests with no real User-Agent (the default
+# urllib request pandas.read_html sends under the hood has none) -- this was silently
+# failing on every GitHub Actions run, which meant the script was falling back to the
+# 30-ticker hardcoded list below on EVERY single run since this was built, not just
+# occasionally. Wikipedia's own bot-etiquette policy is to identify yourself with a
+# descriptive UA + contact URL, which also happens to fix the blocking.
+WIKI_HEADERS = {
+    "User-Agent": "indoetf-data-fetcher/1.0 (https://github.com/rhdano099/indoetf; "
+                  "market-breadth data pull, runs a few times a day)"
+}
 HISTORY_PERIOD = "max"    # pull every available day per ticker, same depth as the
                           # Nifty breadth panels (up to ~25 years for older names).
                           # IMPORTANT: yfinance's period= argument only accepts a fixed
@@ -70,7 +82,9 @@ def load_sp500_tickers():
     500-stock breadth measure, and the script says so loudly if it has to
     use it."""
     try:
-        tables = pd.read_html(WIKI_SP500_URL)
+        resp = requests.get(WIKI_SP500_URL, headers=WIKI_HEADERS, timeout=20)
+        resp.raise_for_status()
+        tables = pd.read_html(io.StringIO(resp.text))
         df = tables[0]
         col = "Symbol" if "Symbol" in df.columns else df.columns[0]
         tickers = sorted(set(str(t).strip().replace(".", "-") for t in df[col].dropna()))
@@ -79,6 +93,15 @@ def load_sp500_tickers():
         print(f"Loaded {len(tickers)} S&P 500 constituents from Wikipedia")
         return tickers
     except Exception as e:  # noqa: BLE001
+        # This is not a quiet edge case -- it means every single downstream breadth number
+        # (% above 200 SMA, new highs/lows) gets computed over 30 mega-caps instead of the
+        # real 500, which is wrong enough to be misleading rather than just "a rough
+        # placeholder". Print a GitHub Actions warning annotation (shows up highlighted in
+        # the run's summary/checks tab, unlike a plain stderr line) so this can't go
+        # unnoticed silently again the way it did before.
+        print(f"::warning::S&P 500 constituent scrape failed ({e}) -- falling back to a "
+              f"30-stock placeholder list. Market breadth numbers from this run are NOT a "
+              f"real S&P-500-wide reading.", file=sys.stderr)
         print(f"WARNING: could not load the S&P 500 list from Wikipedia ({e}).", file=sys.stderr)
         print("Falling back to a small hardcoded set of large S&P 500 names -- this will NOT "
               "produce a real S&P-500-wide breadth reading, only a rough placeholder. Re-run "
