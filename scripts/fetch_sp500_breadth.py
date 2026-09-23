@@ -42,6 +42,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -110,7 +111,7 @@ def compute_breadth(price_panel: pd.DataFrame):
     valid = sma200.notna() & price_panel.notna()
     n_valid = valid.sum(axis=1)
     n_above = (above & valid).sum(axis=1)
-    pct_above = (n_above / n_valid.replace(0, pd.NA) * 100).round(2)
+    pct_above = (n_above / n_valid.replace(0, np.nan) * 100).round(2)
 
     roll_high = price_panel.rolling(252, min_periods=100).max()
     roll_low = price_panel.rolling(252, min_periods=100).min()
