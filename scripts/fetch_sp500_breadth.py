@@ -196,7 +196,15 @@ def main():
     print("\nFetching S&P 500 (^GSPC) index level for the price chart...")
     spx = pull_history("^GSPC", HISTORY_YEARS)
     if spx is not None:
-        price_series = [[row["date"].strftime("%Y-%m-%d"), row["^GSPC"]] for _, row in spx.iterrows()]
+        # Drop any row with a missing date or price before serializing -- yfinance
+        # occasionally returns a stray row with a NaT date or NaN close (e.g. a
+        # half-day / data gap), and json.dumps can't serialize pandas' NaT marker
+        # at all (raises TypeError: Object of type NaTType is not JSON serializable).
+        spx_clean = spx.dropna(subset=["date", "^GSPC"])
+        dropped = len(spx) - len(spx_clean)
+        if dropped:
+            print(f"  (dropped {dropped} row(s) with a missing date/price before writing)")
+        price_series = [[row["date"].strftime("%Y-%m-%d"), float(row["^GSPC"])] for _, row in spx_clean.iterrows()]
         (DATA_DIR / "sp500-price.json").write_text(json.dumps(price_series))
         print(f"Wrote {DATA_DIR / 'sp500-price.json'} ({len(price_series)} days)")
     else:
