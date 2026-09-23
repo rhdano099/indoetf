@@ -20,6 +20,21 @@ later batch in the run silently comes back empty. Progress is saved to disk afte
 batch, so a run that gets cut off partway (timeout, rate-limit) still keeps whatever it
 got instead of losing the whole thing.
 
+Merges into the PREVIOUSLY COMMITTED data/global-etf-history.json instead of overwriting
+it from scratch (same reasoning as fetch_etf_data.py's merge). This matters even more
+here than for the NSE-only script: this universe spans US, London, Frankfurt, Paris,
+Tokyo, Zurich, Milan and Madrid listings, all closing at different times relative to when
+this workflow actually runs. A run that fires (scheduled or manual) before every one of
+those markets has closed for the day will only have a fresh close for whichever exchanges
+had already closed by then -- overwriting from scratch previously meant every OTHER
+ticker's file entry got silently reset to whatever data this run happened to fetch for
+it (which, for exchanges not yet closed, is still yesterday's close, same as before), and
+the site's "1D" logic then found almost no ticker with data for both "yesterday" and
+"today" since most tickers' most-recent date never actually advanced. Merging preserves
+each ticker's own progress and lets the very next run (or the same day's later scheduled
+run) top up whichever exchanges had already closed, without needing every exchange in the
+world to close before a single run can produce a usable file.
+
 Run locally with:  python3 scripts/fetch_global_etf_data.py
 Runs automatically via .github/workflows/update-data.yml (as its own parallel job).
 No API key needed — yfinance reads Yahoo Finance's public endpoints.
@@ -122,6 +137,32 @@ BATCH_SIZE = 30
 RETRIES = 4
 SLEEP_BETWEEN_BATCHES = 2.5
 SLEEP_ON_RETRY = 10.0
+MAX_ROWS_PER_TICKER = 310   # ~14 months of trading days -- caps how far merging with the
+                            # previous file can grow each ticker's series (see LOOKBACK).
+
+
+def load_existing():
+    """The previously committed data/global-etf-history.json, if any -- merged into this
+    run's fresh fetch rather than replaced by it. Missing/corrupt file just means
+    starting from empty, same as the very first run ever."""
+    try:
+        with open(OUT_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def merge_series(old_rows, new_rows):
+    """old_rows/new_rows: [["YYYY-MM-DD", price], ...]. New rows win on a shared date
+    (this run's data is the freshest), but a date present in old_rows and absent from
+    new_rows -- this ticker's exchange hasn't closed yet this run, or Yahoo had a
+    transient gap -- is kept instead of silently dropped. Trimmed to the most recent
+    MAX_ROWS_PER_TICKER dates afterward."""
+    merged = {d: p for d, p in old_rows}
+    for d, p in new_rows:
+        merged[d] = p
+    dates = sorted(merged.keys())[-MAX_ROWS_PER_TICKER:]
+    return [[d, merged[d]] for d in dates]
 
 
 def fetch_batch(tickers):
@@ -152,14 +193,24 @@ def fetch_batch(tickers):
 
 
 def main():
-    result = {}
+    existing = load_existing()
+    result = dict(existing)  # start from what's already committed, not from scratch --
+                              # see the merge_series note above for why this matters even
+                              # more here than in fetch_etf_data.py.
     missing = []
+    gap_new = []
     n_batches = (len(TICKERS) - 1) // BATCH_SIZE + 1
     for i in range(0, len(TICKERS), BATCH_SIZE):
         batch = TICKERS[i:i + BATCH_SIZE]
         batch_num = i // BATCH_SIZE + 1
         got = fetch_batch(batch)
-        result.update(got)
+        for t, rows in got.items():
+            old_dates = {d for d, _ in existing.get(t, [])}
+            merged = merge_series(existing.get(t, []), rows)
+            new_dates = {d for d, _ in merged} - old_dates
+            if new_dates:
+                gap_new.append((t, sorted(new_dates)))
+            result[t] = merged
         missing.extend([t for t in batch if t not in got])
         print(f"Batch {batch_num}/{n_batches}: got {len(got)}/{len(batch)} — running total {len(result)}")
         # Save progress after every batch so a mid-run failure/timeout still leaves
@@ -168,9 +219,13 @@ def main():
             json.dump(result, f, separators=(",", ":"))
         time.sleep(SLEEP_BETWEEN_BATCHES)
 
-    print(f"Wrote {OUT_PATH}: {len(result)}/{len(TICKERS)} tickers.")
+    print(f"\nWrote {OUT_PATH}: {len(result)}/{len(TICKERS)} tickers.")
     if missing:
-        print(f"Missing ({len(missing)}): {missing[:30]}{'...' if len(missing) > 30 else ''}")
+        print(f"Missing entirely this run ({len(missing)}): {missing[:30]}{'...' if len(missing) > 30 else ''}")
+    if gap_new:
+        print(f"Newly added/backfilled dates this run (merged in, not overwritten):")
+        for t, dates in gap_new:
+            print(f"  {t}: {dates}")
 
 
 if __name__ == "__main__":
