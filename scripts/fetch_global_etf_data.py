@@ -36,7 +36,7 @@ TICKERS = [
     'VXUS','INDA','EWT','XLRE','HDV','IWF','EWJ','XRT','VGT','1545.T','DIA','VNQ',
     'EFV','IJR','SCHV','VTI','XOP','SCHE','IHI','VO','EWH','VTV','SPDW','FNDX',
     'VEU','SCHA','MCHI','ACWI','ILF','VT','CNYA.L','EWA','EMXC','XHB','SPLV','SPMO',
-    'ITB','XME','IWD','USMV','VGK','AIQ','PAVE','SPSM','FINA','SPEM','IWR','EWC',
+    'ITB','XME','IWD','USMV','VGK','ROBT','PAVE','SPSM','FINA','SPEM','IWR','EWC',
     'IDEV','KBWB','FXN','FNDF','CIBR','ITOT','IVW','SPHQ','JPIE','MTUM','EUFN','KBE',
     'SCZ','BBJP','SPMD','IQLT','DGRO','XLG','SASU.L','EIDO','MGK','SCHM','FENY','EWU',
     'VYM','KIE','VLUE','FNDE','EWW','SHLD','SCHK','NOBL','IYZ','RDVY','CQQQ','DTCR',
