@@ -50,7 +50,14 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 
 WIKI_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-HISTORY_YEARS = 2          # covers 200-day SMA + 52-week hi/lo with room to spare
+HISTORY_PERIOD = "max"    # pull every available day per ticker, same depth as the
+                          # Nifty breadth panels (up to ~25 years for older names).
+                          # IMPORTANT: yfinance's period= argument only accepts a fixed
+                          # set of strings (1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max) -- an
+                          # arbitrary value like "25y" silently fails. This bit us once
+                          # already in a different project's data puller (01_pull_data.py
+                          # there), fixed by switching to an explicit start= date; here
+                          # "max" is simpler and already valid, so it's used directly.
 CHECKPOINT_EVERY = 50
 
 
@@ -83,11 +90,11 @@ def load_sp500_tickers():
         ]
 
 
-def pull_history(ticker, years, retries=3, base_wait=2.0):
+def pull_history(ticker, period=HISTORY_PERIOD, retries=3, base_wait=2.0):
     last_err = None
     for attempt in range(1, retries + 1):
         try:
-            hist = yf.Ticker(ticker).history(period=f"{years}y", interval="1d", auto_adjust=True)
+            hist = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
             if hist is None or hist.empty:
                 return None
             hist = hist.reset_index()
@@ -155,7 +162,7 @@ def main():
     failed = []
 
     for i, t in enumerate(tickers, 1):
-        df = pull_history(t, HISTORY_YEARS)
+        df = pull_history(t)
         if df is None:
             failed.append(t)
         else:
@@ -194,7 +201,7 @@ def main():
     print(f"Wrote {DATA_DIR / 'breadth-extra-sp500.json'} (merged into breadth-extra.json by the workflow)")
 
     print("\nFetching S&P 500 (^GSPC) index level for the price chart...")
-    spx = pull_history("^GSPC", HISTORY_YEARS)
+    spx = pull_history("^GSPC")
     if spx is not None:
         # Drop any row with a missing date or price before serializing -- yfinance
         # occasionally returns a stray row with a NaT date or NaN close (e.g. a
