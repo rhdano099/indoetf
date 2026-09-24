@@ -78,13 +78,18 @@ def load_existing():
 
 
 def merge_series(old_rows, new_rows):
-    """old_rows/new_rows: [["YYYY-MM-DD", price], ...]. New rows win on a shared date
-    (this run's data is the freshest), but a date present in old_rows and absent from
-    new_rows -- this run's fetch had a transient gap on that day -- is kept instead of
-    silently dropped. Trimmed to the most recent MAX_ROWS_PER_TICKER dates afterward."""
-    merged = {d: p for d, p in old_rows}
-    for d, p in new_rows:
-        merged[d] = p
+    """old_rows/new_rows: [["YYYY-MM-DD", price], ...]. Reads old_rows by index (row[0],
+    row[1]) rather than unpacking exactly 2 values -- a briefly-deployed earlier version of
+    this script committed some 3-element [date, close, open] rows, and old_rows is whatever
+    is already sitting in the committed JSON, so this has to tolerate that leftover shape
+    (and any other stray extra fields) without crashing, discarding anything past the close.
+    New rows win on a shared date (this run's data is the freshest), but a date present in
+    old_rows and absent from new_rows -- this run's fetch had a transient gap on that day --
+    is kept instead of silently dropped. Trimmed to the most recent MAX_ROWS_PER_TICKER
+    dates afterward."""
+    merged = {row[0]: row[1] for row in old_rows}
+    for row in new_rows:
+        merged[row[0]] = row[1]
     dates = sorted(merged.keys())[-MAX_ROWS_PER_TICKER:]
     return [[d, merged[d]] for d in dates]
 
