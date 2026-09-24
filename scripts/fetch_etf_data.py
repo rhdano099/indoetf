@@ -33,7 +33,6 @@ each run being an independent all-or-nothing snapshot.
 """
 import json
 import time
-import pandas as pd
 import yfinance as yf
 
 # The 98 symbols from the NSE ETF master sheet (MW-ETF-17-Sep-2026.csv).
@@ -79,18 +78,15 @@ def load_existing():
 
 
 def merge_series(old_rows, new_rows):
-    """old_rows/new_rows: [["YYYY-MM-DD", close, open], ...] (old rows fetched before the
-    open price was added may be 2-element [date, close] -- kept as-is, the front end just
-    treats those specific dates as having no intraday/open data for the "1D" calc).
-    New rows win on a shared date (this run's data is the freshest), but a date present in
-    old_rows and absent from new_rows -- this run's fetch had a transient gap on that day --
-    is kept instead of silently dropped. Trimmed to the most recent MAX_ROWS_PER_TICKER
-    dates afterward."""
-    merged = {row[0]: row for row in old_rows}
-    for row in new_rows:
-        merged[row[0]] = row
+    """old_rows/new_rows: [["YYYY-MM-DD", price], ...]. New rows win on a shared date
+    (this run's data is the freshest), but a date present in old_rows and absent from
+    new_rows -- this run's fetch had a transient gap on that day -- is kept instead of
+    silently dropped. Trimmed to the most recent MAX_ROWS_PER_TICKER dates afterward."""
+    merged = {d: p for d, p in old_rows}
+    for d, p in new_rows:
+        merged[d] = p
     dates = sorted(merged.keys())[-MAX_ROWS_PER_TICKER:]
-    return [merged[d] for d in dates]
+    return [[d, merged[d]] for d in dates]
 
 
 def fetch_batch(tickers):
@@ -111,20 +107,10 @@ def fetch_batch(tickers):
     single = len(tickers) == 1
     for t in tickers:
         try:
-            frame = raw if single else raw[t + ".NS"]
-            closes = frame["Close"].dropna()
-            if len(closes) == 0:
-                continue
-            rows = [[d.strftime("%Y-%m-%d"), round(float(c), 4)] for d, c in closes.items()]
-            # Only the most recent day in this batch gets its own open price attached --
-            # that's the only day the site's "1D" change (close vs that same day's open,
-            # computed client-side) ever needs. Storing open for the rest of the ~2-year
-            # history would bloat the file for no benefit.
-            last_date = closes.index[-1]
-            last_open = frame["Open"].get(last_date)
-            if last_open is not None and not pd.isna(last_open):
-                rows[-1] = [rows[-1][0], rows[-1][1], round(float(last_open), 4)]
-            out[t] = rows
+            s = raw["Close"] if single else raw[t + ".NS"]["Close"]
+            s = s.dropna()
+            if len(s) > 0:
+                out[t] = [[d.strftime("%Y-%m-%d"), round(float(c), 4)] for d, c in s.items()]
         except Exception:
             continue
     return out
