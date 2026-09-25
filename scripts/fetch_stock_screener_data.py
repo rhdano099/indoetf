@@ -35,8 +35,8 @@ given metric report null for it rather than being dropped from the universe enti
 
 Run locally with:  python3 scripts/fetch_stock_screener_data.py
 Runs automatically via .github/workflows/update-data.yml (as its own parallel job, alongside
-fetch_breakout_scanner.py).
-No API key needed -- yfinance reads Yahoo Finance's public endpoints.
+fetch_breakout_scanner.py). Needs curl_cffi installed (pip install curl_cffi) -- see the note
+above OUT_PATH for why.
 """
 import json
 import os
@@ -172,26 +172,37 @@ TICKERS = STOCK_TICKERS
 
 OUT_PATH = "data/stock-screener.json"
 LOOKBACK = "1y"   # ~252 trading days -- enough for the 52-week-high check and both SMAs.
-# Smaller batches + longer, exponential-backoff pauses than the original version. In
-# practice a GitHub Actions runner's IP gets rate-limited by Yahoo Finance after roughly the
-# first batch of requests -- every batch after that would come back empty even after 4
-# linear-backoff retries, silently truncating the universe to whatever got through first
-# (this happened to both this scanner and the ETF one). The fixes below:
-#   1) smaller batches + a longer flat pause between them, to slow the request rate down
-#      before Yahoo's limiter trips at all;
-#   2) exponential (not linear) backoff with jitter on a failed batch;
-#   3) an extra "cool down" pause if several batches in a row come back completely empty
-#      (a strong signal of active rate-limiting, not just one flaky ticker);
-#   4) merging into the previously-committed data/stock-screener.json instead of overwriting it,
-#      so a run that only gets partway through the universe keeps everything a prior
-#      successful run already fetched for the tickers it didn't reach this time (same
-#      pattern as fetch_global_etf_data.py's load_existing()/merge_series()).
-BATCH_SIZE = 15
-RETRIES = 5
-SLEEP_BETWEEN_BATCHES = 6.0
-SLEEP_ON_RETRY = 12.0            # base for exponential backoff: 12 * 2**attempt + jitter
-COOLDOWN_AFTER_EMPTY_BATCHES = 60.0   # extra pause once MAX_CONSECUTIVE_EMPTY batches in a row are empty
-MAX_CONSECUTIVE_EMPTY = 3
+# --- Why this fetch is structured the way it is ---
+# The very first version of this script (single yf.download() call per batch of 30
+# tickers) got the FIRST batch through fine and then came back completely empty for every
+# batch after that, every run, no matter how much the inter-batch sleep/backoff was
+# increased. That pattern -- works once, then hard-blocked regardless of pacing -- points to
+# Yahoo Finance's bot detection fingerprinting the plain requests/urllib3 TLS handshake that
+# yfinance uses by default (well documented as an issue specifically on cloud/datacenter IPs
+# like GitHub Actions runners), not simple request-rate throttling. Slowing down a blocked
+# client doesn't unblock it.
+#
+# The fix is to route requests through curl_cffi, which impersonates a real Chrome TLS
+# fingerprint so Yahoo's bot detection doesn't flag the traffic in the first place. Combined
+# with that: per-ticker fetches (not multi-ticker batch downloads, so one bad/delisted ticker
+# can't take down a whole batch's worth of others), a short pause between tickers, and --
+# still kept as a second line of defense -- exponential backoff plus merging into the
+# previously-committed data/stock-screener.json instead of overwriting it, so a run that still hits
+# trouble partway through keeps everything a prior successful run already fetched (same
+# pattern as fetch_global_etf_data.py's load_existing()/merge_series()).
+RETRIES = 4
+SLEEP_BETWEEN_TICKERS = 1.2
+SLEEP_ON_RETRY = 6.0             # base for exponential backoff: 6 * 2**attempt + jitter
+SAVE_EVERY = 25                  # write progress to disk every N tickers processed
+
+try:
+    from curl_cffi import requests as cffi_requests
+    _SESSION = cffi_requests.Session(impersonate="chrome")
+except ImportError:
+    print("WARNING: curl_cffi not installed -- falling back to yfinance's default session, "
+          "which is the thing that was getting blocked. Add curl_cffi to the workflow's "
+          "'pip install' step.")
+    _SESSION = None
 
 HIGH20_WINDOW = 20
 HIGH52W_WINDOW = 252
@@ -278,73 +289,47 @@ def load_existing():
         return {}
 
 
-def fetch_batch(tickers):
-    raw = None
+def fetch_one(t):
     for attempt in range(RETRIES):
         try:
-            raw = yf.download(tickers, period=LOOKBACK, interval="1d", auto_adjust=True,
-                               group_by="ticker", threads=False, progress=False)
-            if raw is not None and len(raw) > 0:
-                break
+            tk = yf.Ticker(t, session=_SESSION)
+            df = tk.history(period=LOOKBACK, interval="1d", auto_adjust=True)
+            if df is not None and len(df) > 0:
+                return df
         except Exception as e:
-            print(f"  batch download attempt {attempt+1} failed: {e}")
-            raw = None
-        # Exponential backoff with jitter -- the original flat linear backoff (10 * attempt)
-        # wasn't enough to recover once Yahoo's rate limiter actually kicked in.
-        sleep_s = SLEEP_ON_RETRY * (2 ** attempt) + random.uniform(0, 3)
+            print(f"  {t}: attempt {attempt+1} failed: {e}")
+        sleep_s = SLEEP_ON_RETRY * (2 ** attempt) + random.uniform(0, 2)
         time.sleep(sleep_s)
-    if raw is None or len(raw) == 0:
-        return {}
-    single = len(tickers) == 1
-    out = {}
-    for t in tickers:
-        try:
-            df = raw if single else raw[t]
-            out[t] = df
-        except Exception:
-            continue
-    return out
+    return None
 
 
 def main():
     existing = load_existing()
     rows_by_ticker = dict(existing)   # start from the last good run, not from scratch
-    consecutive_empty = 0
-    n_batches = (len(TICKERS) - 1) // BATCH_SIZE + 1
-    for i in range(0, len(TICKERS), BATCH_SIZE):
-        batch = TICKERS[i:i + BATCH_SIZE]
-        batch_num = i // BATCH_SIZE + 1
-        dfs = fetch_batch(batch)
-
-        for t in batch:
-            df = dfs.get(t)
-            if df is None:
-                continue  # keep whatever this ticker had from a previous run, if anything
+    n = len(TICKERS)
+    got_this_run = 0
+    for i, t in enumerate(TICKERS, start=1):
+        df = fetch_one(t)
+        if df is not None:
             scored = score_ticker(t, df)
             if scored:
                 rows_by_ticker[t] = scored
-
-        consecutive_empty = consecutive_empty + 1 if not dfs else 0
-
-        rows = list(rows_by_ticker.values())
-        flagged = sum(1 for r in rows if r["breakout"])
-        print(f"Batch {batch_num}/{n_batches}: {len(rows_by_ticker)} unique tickers with data so far, {flagged} flagged")
-
-        # Save progress after every batch -- a run cut off partway keeps whatever it has
-        # (this run's new data merged with the prior run's) instead of losing everything.
-        with open(OUT_PATH, "w") as f:
-            json.dump({"asof": time.strftime("%Y-%m-%d"), "rows": rows}, f, separators=(",", ":"))
-
-        if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
-            print(f"  {consecutive_empty} batches in a row came back completely empty -- likely rate-limited. Cooling down {COOLDOWN_AFTER_EMPTY_BATCHES:.0f}s before continuing.")
-            time.sleep(COOLDOWN_AFTER_EMPTY_BATCHES)
-            consecutive_empty = 0
+                got_this_run += 1
         else:
-            time.sleep(SLEEP_BETWEEN_BATCHES)
+            print(f"  {t}: no data after {RETRIES} attempts -- keeping prior data for it if any")
+
+        if i % SAVE_EVERY == 0 or i == n:
+            rows = list(rows_by_ticker.values())
+            flagged = sum(1 for r in rows if r["breakout"])
+            print(f"{i}/{n} processed ({got_this_run} fetched this run, {len(rows_by_ticker)} unique tickers total, {flagged} flagged)")
+            with open(OUT_PATH, "w") as f:
+                json.dump({"asof": time.strftime("%Y-%m-%d"), "rows": rows}, f, separators=(",", ":"))
+
+        time.sleep(SLEEP_BETWEEN_TICKERS)
 
     rows = list(rows_by_ticker.values())
     flagged = sum(1 for r in rows if r["breakout"])
-    print(f"Wrote data/stock-screener.json: {len(rows)}/{len(TICKERS)} stock tickers scored, {flagged} flagged as breaking out.")
+    print(f"Wrote data/stock-screener.json: {len(rows)}/{n} stock tickers scored ({got_this_run} fetched this run), {flagged} flagged as breaking out.")
 
 
 if __name__ == "__main__":
