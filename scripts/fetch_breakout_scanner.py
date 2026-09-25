@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Rules-based "breaking out today" scanner over the same ~966-ticker global ETF universe as
+Rules-based "breaking out today" scanner over the same 966-ticker global ETF universe as
 fetch_global_etf_data.py (imports its TICKERS list directly, so there's one source of truth
 for the universe). This is the simple, no-ML scanner from the ETF-ML-Screener project's
 05_current_breakouts.py, ported to run daily in this repo's own GitHub Action instead of
-locally -- NOT the trained ML breakout-probability model, which is a separate, heavier
+locally — NOT the trained ML breakout-probability model, which is a separate, heavier
 project kept local for now.
 
 The default flag (also the one used server-side for the "asof"-day snapshot) is:
@@ -12,7 +12,7 @@ The default flag (also the one used server-side for the "asof"-day snapshot) is:
     average volume
 
 ...but the lookback window (20/50/100/200 days) and the volume multiple are both adjustable
-on the site itself, live, with no extra fetch -- each row also carries its own trimmed
+on the site itself, live, with no extra fetch — each row also carries its own trimmed
 close/volume history (last ~210 trading days, enough to cover a 200-day lookback with a
 20-day volume-average tail), and the page recomputes the flag in JavaScript whenever the
 person changes either control. The 52-week-high, RSI(14), and 50-day/200-day-SMA trend
@@ -34,16 +34,27 @@ entry = today) used to recompute high20/high50/high100/high200 and the volume ra
 client-side for any lookback the person picks. Tickers with too little history to compute a
 given metric report null for it rather than being dropped from the universe entirely (e.g. a
 recently-listed ETF can still get a 20-day-high flag even without 252 days for a
-52-week-high flag, and the client-side recompute falls back to "--" for a lookback longer
+52-week-high flag, and the client-side recompute falls back to "—" for a lookback longer
 than the ticker's available history).
+
+--- Why this version routes through curl_cffi ---
+The original batch design here (yf.download() over 30-ticker batches, threads=False, plain
+linear retry backoff) is fast when it works, but on a GitHub Actions runner it was getting
+the first batch through and then coming back completely empty for every batch after that,
+regardless of how much the backoff was tuned. That symptom -- works once, then silently
+blocked -- is Yahoo Finance's bot detection fingerprinting the default requests/urllib3 TLS
+handshake yfinance uses, not simple rate-limiting (which slowing down would actually fix).
+Routing requests through curl_cffi, which impersonates a real Chrome TLS fingerprint, is the
+standard workaround for this exact GitHub-Actions-specific failure mode, and it's a one-line
+addition (a session object passed into yf.download) that doesn't change the batch size,
+pacing, or overall runtime of the original script at all.
 
 Run locally with:  python3 scripts/fetch_breakout_scanner.py
 Runs automatically via .github/workflows/update-data.yml (as its own parallel job). Needs
-curl_cffi installed (pip install curl_cffi) -- see the note above OUT_PATH for why.
+curl_cffi installed (pip install curl_cffi) -- see the note above for why.
 """
 import json
 import os
-import random
 import time
 
 import yfinance as yf
@@ -51,39 +62,21 @@ import pandas as pd
 
 from fetch_global_etf_data import TICKERS
 
-OUT_PATH = "data/breakout-scanner.json"
-LOOKBACK = "1y"   # ~252 trading days -- enough for the 52-week-high check and both SMAs.
-# --- Why this fetch is structured the way it is ---
-# The very first version of this script (single yf.download() call per batch of 30
-# tickers) got the FIRST batch through fine and then came back completely empty for every
-# batch after that, every run, no matter how much the inter-batch sleep/backoff was
-# increased. That pattern -- works once, then hard-blocked regardless of pacing -- points to
-# Yahoo Finance's bot detection fingerprinting the plain requests/urllib3 TLS handshake that
-# yfinance uses by default (well documented as an issue specifically on cloud/datacenter IPs
-# like GitHub Actions runners), not simple request-rate throttling. Slowing down a blocked
-# client doesn't unblock it.
-#
-# The fix is to route requests through curl_cffi, which impersonates a real Chrome TLS
-# fingerprint so Yahoo's bot detection doesn't flag the traffic in the first place. Combined
-# with that: per-ticker fetches (not multi-ticker batch downloads, so one bad/delisted ticker
-# can't take down a whole batch's worth of others), a short pause between tickers, and --
-# still kept as a second line of defense -- exponential backoff plus merging into the
-# previously-committed data/breakout-scanner.json instead of overwriting it, so a run that still hits
-# trouble partway through keeps everything a prior successful run already fetched (same
-# pattern as fetch_global_etf_data.py's load_existing()/merge_series()).
-RETRIES = 4
-SLEEP_BETWEEN_TICKERS = 1.2
-SLEEP_ON_RETRY = 6.0             # base for exponential backoff: 6 * 2**attempt + jitter
-SAVE_EVERY = 25                  # write progress to disk every N tickers processed
-
 try:
     from curl_cffi import requests as cffi_requests
     _SESSION = cffi_requests.Session(impersonate="chrome")
 except ImportError:
     print("WARNING: curl_cffi not installed -- falling back to yfinance's default session, "
-          "which is the thing that was getting blocked. Add curl_cffi to the workflow's "
-          "'pip install' step.")
+          "which is the thing that was getting silently blocked. Add curl_cffi to the "
+          "workflow's 'pip install' step.")
     _SESSION = None
+
+OUT_PATH = "data/breakout-scanner.json"
+LOOKBACK = "1y"   # ~252 trading days — enough for the 52-week-high check and both SMAs.
+BATCH_SIZE = 30
+RETRIES = 4
+SLEEP_BETWEEN_BATCHES = 2.5
+SLEEP_ON_RETRY = 10.0
 
 HIGH20_WINDOW = 20
 HIGH52W_WINDOW = 252
@@ -92,10 +85,6 @@ RSI_WINDOW = 14
 SMA_SHORT = 50
 SMA_LONG = 200
 VOL_RATIO_BREAKOUT_MIN = 1.5
-# Longest lookback the site's controls offer is 200 days; a 200-day volume average also
-# needs 200 prior days, so 210 gives a small comfortable margin without shipping the full
-# ~252-day fetch window (which would ~20% inflate the JSON for no benefit -- the fixed-window
-# 52-week-high/SMA200 columns are computed here, server-side, from the full fetch instead).
 CLIENT_HISTORY_WINDOW = 210
 
 
@@ -126,7 +115,7 @@ def score_ticker(t, df):
 
     vol_ratio = None
     if len(vols) >= VOL_AVG_WINDOW + 1:
-        avg_vol = float(vols.iloc[-(VOL_AVG_WINDOW + 1):-1].mean())  # trailing 20 days, excluding today
+        avg_vol = float(vols.iloc[-(VOL_AVG_WINDOW + 1):-1].mean())
         today_vol = float(vols.iloc[-1])
         if avg_vol > 0:
             vol_ratio = round(today_vol / avg_vol, 2)
@@ -158,8 +147,11 @@ def score_ticker(t, df):
 
 
 def load_existing():
-    """The previously committed data/breakout-scanner.json, if any -- keyed by ticker so this run
-    can merge on top of it instead of starting from scratch (see the note above OUT_PATH)."""
+    """The previously committed data/breakout-scanner.json, if any -- keyed by ticker so a
+    run that still hits trouble partway through merges on top of it instead of wiping out
+    everything a prior successful run already fetched (same pattern as
+    fetch_global_etf_data.py's load_existing()/merge_series()). Free at runtime -- one read
+    at startup, no effect on the fetch loop's pacing."""
     if not os.path.exists(OUT_PATH):
         return {}
     try:
@@ -170,57 +162,59 @@ def load_existing():
         return {}
 
 
-def fetch_one(t):
+def fetch_batch(tickers):
+    raw = None
     for attempt in range(RETRIES):
         try:
-            tk = yf.Ticker(t, session=_SESSION)
-            df = tk.history(period=LOOKBACK, interval="1d", auto_adjust=True)
-            if df is not None and len(df) > 0:
-                return df
-            # An empty result with NO exception raised is yfinance's own "No data found,
-            # symbol may be delisted" -- a definitive answer (wrong/delisted ticker), not a
-            # transient network/rate-limit hiccup. Retrying that with exponential backoff
-            # just burns ~90+ seconds per bad ticker for something that can never succeed,
-            # which is what made this scanner crawl to a near-halt on a universe with even a
-            # modest number of stale/incorrect tickers in it. Fail fast here instead --
-            # only an actual exception below gets the backoff-and-retry treatment, since
-            # that's the case that might plausibly be transient.
-            print(f"  {t}: no data (symbol likely invalid/delisted) -- not retrying")
-            return None
+            raw = yf.download(tickers, period=LOOKBACK, interval="1d", auto_adjust=True,
+                               group_by="ticker", threads=False, progress=False,
+                               session=_SESSION)
+            if raw is not None and len(raw) > 0:
+                break
         except Exception as e:
-            print(f"  {t}: attempt {attempt+1} failed: {e}")
-            sleep_s = SLEEP_ON_RETRY * (2 ** attempt) + random.uniform(0, 2)
-            time.sleep(sleep_s)
-    return None
+            print(f"  batch download attempt {attempt+1} failed: {e}")
+            raw = None
+        time.sleep(SLEEP_ON_RETRY * (attempt + 1))
+    if raw is None or len(raw) == 0:
+        return {}
+    single = len(tickers) == 1
+    out = {}
+    for t in tickers:
+        try:
+            df = raw if single else raw[t]
+            out[t] = df
+        except Exception:
+            continue
+    return out
 
 
 def main():
     existing = load_existing()
     rows_by_ticker = dict(existing)   # start from the last good run, not from scratch
-    n = len(TICKERS)
-    got_this_run = 0
-    for i, t in enumerate(TICKERS, start=1):
-        df = fetch_one(t)
-        if df is not None:
+    n_batches = (len(TICKERS) - 1) // BATCH_SIZE + 1
+    for i in range(0, len(TICKERS), BATCH_SIZE):
+        batch = TICKERS[i:i + BATCH_SIZE]
+        batch_num = i // BATCH_SIZE + 1
+        dfs = fetch_batch(batch)
+        for t in batch:
+            df = dfs.get(t)
+            if df is None:
+                continue  # keep whatever this ticker had from a previous run, if anything
             scored = score_ticker(t, df)
             if scored:
                 rows_by_ticker[t] = scored
-                got_this_run += 1
-        else:
-            print(f"  {t}: no data after {RETRIES} attempts -- keeping prior data for it if any")
 
-        if i % SAVE_EVERY == 0 or i == n:
-            rows = list(rows_by_ticker.values())
-            flagged = sum(1 for r in rows if r["breakout"])
-            print(f"{i}/{n} processed ({got_this_run} fetched this run, {len(rows_by_ticker)} unique tickers total, {flagged} flagged)")
-            with open(OUT_PATH, "w") as f:
-                json.dump({"asof": time.strftime("%Y-%m-%d"), "rows": rows}, f, separators=(",", ":"))
-
-        time.sleep(SLEEP_BETWEEN_TICKERS)
+        rows = list(rows_by_ticker.values())
+        flagged = sum(1 for r in rows if r["breakout"])
+        print(f"Batch {batch_num}/{n_batches}: {len(rows_by_ticker)} unique tickers with data so far, {flagged} flagged")
+        # Save progress after every batch — a run cut off partway keeps whatever it has.
+        with open(OUT_PATH, "w") as f:
+            json.dump({"asof": time.strftime("%Y-%m-%d"), "rows": rows}, f, separators=(",", ":"))
+        time.sleep(SLEEP_BETWEEN_BATCHES)
 
     rows = list(rows_by_ticker.values())
     flagged = sum(1 for r in rows if r["breakout"])
-    print(f"Wrote data/breakout-scanner.json: {len(rows)}/{n} ETF tickers scored ({got_this_run} fetched this run), {flagged} flagged as breaking out.")
+    print(f"Wrote {OUT_PATH}: {len(rows)}/{len(TICKERS)} tickers scored, {flagged} flagged as breaking out.")
 
 
 if __name__ == "__main__":
