@@ -177,10 +177,20 @@ def fetch_one(t):
             df = tk.history(period=LOOKBACK, interval="1d", auto_adjust=True)
             if df is not None and len(df) > 0:
                 return df
+            # An empty result with NO exception raised is yfinance's own "No data found,
+            # symbol may be delisted" -- a definitive answer (wrong/delisted ticker), not a
+            # transient network/rate-limit hiccup. Retrying that with exponential backoff
+            # just burns ~90+ seconds per bad ticker for something that can never succeed,
+            # which is what made this scanner crawl to a near-halt on a universe with even a
+            # modest number of stale/incorrect tickers in it. Fail fast here instead --
+            # only an actual exception below gets the backoff-and-retry treatment, since
+            # that's the case that might plausibly be transient.
+            print(f"  {t}: no data (symbol likely invalid/delisted) -- not retrying")
+            return None
         except Exception as e:
             print(f"  {t}: attempt {attempt+1} failed: {e}")
-        sleep_s = SLEEP_ON_RETRY * (2 ** attempt) + random.uniform(0, 2)
-        time.sleep(sleep_s)
+            sleep_s = SLEEP_ON_RETRY * (2 ** attempt) + random.uniform(0, 2)
+            time.sleep(sleep_s)
     return None
 
 
