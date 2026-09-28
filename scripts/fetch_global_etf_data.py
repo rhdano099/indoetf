@@ -37,14 +37,37 @@ each ticker's own progress and lets the very next run (or the same day's later s
 run) top up whichever exchanges had already closed, without needing every exchange in the
 world to close before a single run can produce a usable file.
 
+--- Why this version routes through curl_cffi ---
+Same failure mode already diagnosed and fixed in fetch_breakout_scanner.py: on a GitHub
+Actions runner, the first batch comes through fine and then every batch after that comes
+back silently empty, no matter how the backoff/pacing here is tuned. That's Yahoo Finance's
+bot detection fingerprinting the default requests/urllib3 TLS handshake yfinance uses, not
+rate-limiting -- so routing requests through curl_cffi (which impersonates a real Chrome TLS
+fingerprint) fixes it without changing the batch size, pacing, or runtime of this script at
+all. This is almost certainly the actual cause of the stale/missing tickers users see in the
+Global ETF Heatmap: this script was never given the curl_cffi fix, so on any run where Yahoo
+started blocking partway through, whichever tickers hadn't been reached yet just kept
+whatever (increasingly old) data a previous successful run had left for them.
+
 Run locally with:  python3 scripts/fetch_global_etf_data.py
 Runs automatically via .github/workflows/update-data.yml (as its own parallel job).
-No API key needed — yfinance reads Yahoo Finance's public endpoints.
+No API key needed — yfinance reads Yahoo Finance's public endpoints. Needs curl_cffi
+installed (pip install curl_cffi) -- see the note above for why.
 """
 import json
 import time
+from datetime import datetime, timezone
 
 import yfinance as yf
+
+try:
+    from curl_cffi import requests as cffi_requests
+    _SESSION = cffi_requests.Session(impersonate="chrome")
+except ImportError:
+    print("WARNING: curl_cffi not installed -- falling back to yfinance's default session, "
+          "which is the thing that was getting silently blocked. Add curl_cffi to the "
+          "workflow's 'pip install' step.")
+    _SESSION = None
 
 TICKERS = [
     'SPY', 'QQQ', 'XLF', 'XLE', 'SCHD', 'EEM', 'EWZ', 'IWM', 'FXI', 'XLU',
@@ -487,13 +510,30 @@ MAX_ROWS_PER_TICKER = 310   # ~14 months of trading days -- caps how far merging
                             # previous file can grow each ticker's series (see LOOKBACK).
 
 
+TODAY_STR = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _drop_future_dates(rows):
+    """A handful of tickers (mostly certain non-US exchanges, e.g. APA.NZ) have come back
+    from yfinance with a last bar dated a day AHEAD of this run's own UTC date -- a
+    timezone-labeling quirk on Yahoo's side for those exchanges, not a real future close.
+    Left in place, that bogus date wins gtmLatestDate() on the site (it's a max()), which
+    skews the default 1Y view's end date for EVERY ticker to a session that doesn't really
+    exist yet. Dropping anything dated past "today" (this run's own clock) at both load and
+    fetch time is a cheap, safe filter -- a genuinely valid close is never dated after the
+    day it's fetched on."""
+    return [row for row in rows if row and row[0] <= TODAY_STR]
+
+
 def load_existing():
     """The previously committed data/global-etf-history.json, if any -- merged into this
     run's fresh fetch rather than replaced by it. Missing/corrupt file just means
-    starting from empty, same as the very first run ever."""
+    starting from empty, same as the very first run ever. Also strips any bogus
+    future-dated rows a past run may have already committed (see _drop_future_dates)."""
     try:
         with open(OUT_PATH) as f:
-            return json.load(f)
+            data = json.load(f)
+        return {t: _drop_future_dates(rows) for t, rows in data.items()}
     except Exception:
         return {}
 
@@ -521,7 +561,8 @@ def fetch_batch(tickers):
     for attempt in range(RETRIES):
         try:
             raw = yf.download(tickers, period=LOOKBACK, interval="1d", auto_adjust=True,
-                               group_by="ticker", threads=False, progress=False)
+                               group_by="ticker", threads=False, progress=False,
+                               session=_SESSION)
             if raw is not None and len(raw) > 0:
                 break
         except Exception as e:
@@ -536,7 +577,10 @@ def fetch_batch(tickers):
             s = raw["Close"] if single else raw[t]["Close"]
             s = s.dropna()
             if len(s) > 0:
-                out[t] = [[d.strftime("%Y-%m-%d"), round(float(c), 4)] for d, c in s.items()]
+                rows = [[d.strftime("%Y-%m-%d"), round(float(c), 4)] for d, c in s.items()]
+                rows = _drop_future_dates(rows)
+                if rows:
+                    out[t] = rows
         except Exception:
             continue
     return out
